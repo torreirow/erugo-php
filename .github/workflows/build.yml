@@ -52,7 +52,8 @@ jobs:
       - name: Smoke test
         run: |
           set -euo pipefail
-          docker run -d --name app -p 8080:80 erugo-php:test
+          # Storage is a volume, as in every upstream deployment (first start copies the skeleton)
+          docker run -d --name app -p 8080:80 -v erugo-storage:/var/www/html/storage erugo-php:test
 
           wait_for() { # url expected-code [method]
             for i in $(seq 1 60); do
