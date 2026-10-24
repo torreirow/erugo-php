@@ -1,0 +1,98 @@
+name: Build
+
+# Builds the image on top of the pinned upstream image, smoke-tests it and (on main)
+# pushes to ghcr.io. The weekly run rebuilds without cache so new PHP patch releases from
+# the distribution packages are picked up.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+  # Lowest PHP release with the PHP2Shell fix on the 8.3 branch
+  PHP_MIN: "8.3.36"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read upstream pin
+        id: pin
+        run: |
+          echo "version=$(tr -d '[:space:]' < UPSTREAM_VERSION)" >> "$GITHUB_OUTPUT"
+          echo "short=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build test image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: erugo-php:test
+          no-cache: ${{ github.event_name == 'schedule' }}
+          build-args: |
+            PHP_MIN=${{ env.PHP_MIN }}
+            APP_VERSION=v${{ steps.pin.outputs.version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke test
+        run: |
+          set -euo pipefail
+          docker run -d --name app -p 8080:80 erugo-php:test
+
+          wait_for() { # url expected-code [method]
+            for i in $(seq 1 60); do
+              code=$(curl -s -o /dev/null -w "%{http_code}" -X "${3:-GET}" -H "Tus-Resumable: 1.0.0" "$1" || true)
+              [ "$code" = "$2" ] && { echo "${3:-GET} $1 -> $code"; return 0; }
+              sleep 2
+            done
+            echo "$1 -> $code (expected $2)"; docker logs app; return 1
+          }
+          wait_for http://localhost:8080/api/health 200
+          wait_for http://localhost:8080/ 200
+          # tus upload endpoint (tusd behind Caddy)
+          wait_for http://localhost:8080/files/ 200 OPTIONS
+          docker exec -u erugo app php artisan --version
+          # PHP runtime at or above the minimum (PHP2Shell, CVE-2026-109618/109619)
+          docker exec -e MIN="$PHP_MIN" app php -r 'echo "PHP ", PHP_VERSION, " (minimum ", getenv("MIN"), ")", PHP_EOL; exit(version_compare(PHP_VERSION, getenv("MIN"), ">=") ? 0 : 1);'
+
+      - name: Log in to ghcr.io
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64
+          tags: |
+            ${{ env.IMAGE }}:${{ steps.pin.outputs.version }}
+            ${{ env.IMAGE }}:${{ steps.pin.outputs.version }}-${{ steps.pin.outputs.short }}
+            ${{ env.IMAGE }}:latest
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ steps.pin.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          build-args: |
+            PHP_MIN=${{ env.PHP_MIN }}
+            APP_VERSION=v${{ steps.pin.outputs.version }}
